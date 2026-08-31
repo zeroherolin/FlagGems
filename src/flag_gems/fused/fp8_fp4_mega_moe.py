@@ -76,33 +76,36 @@ def _load_fp4_weight(
     K: tl.constexpr,
     SCALE_IS_UE8M0: tl.constexpr,
 ):
+    # Byte index at half the K width: k = 2j is the low nibble, k = 2j + 1 the
+    # high one, so decoding each nibble over its own half-width fragment reads
+    # every byte once instead of twice. Requires k_offsets to be contiguous from
+    # an even base, which holds at both call sites.
+    kp_offsets = tl.split(tl.reshape(k_offsets, (k_offsets.shape[0] // 2, 2)))[0] // 2
     packed_offsets = (
         expert * stride_e
         + n_offsets[:, None] * stride_n
-        + (k_offsets[None, :] // 2) * stride_kp
+        + kp_offsets[None, :] * stride_kp
     )
-    packed = tl.load(
-        packed_ptr + packed_offsets,
-        mask=(n_offsets[:, None] < N) & (k_offsets[None, :] < K),
-        other=0,
-    ).to(tl.uint8)
-    low = packed & 0x0F
-    high = (packed >> 4) & 0x0F
-    code = tl.where((k_offsets[None, :] & 1) == 0, low, high)
-    values = _decode_e2m1(code)
+    packed_mask = (n_offsets[:, None] < N) & (kp_offsets[None, :] * 2 < K)
+    packed = tl.load(packed_ptr + packed_offsets, mask=packed_mask, other=0).to(
+        tl.uint8
+    )
 
+    # A scale group spans 32 elements, an even count, so both nibbles of a byte
+    # always land in the same group and one scale load serves both.
     scale_offsets = (
         expert * scale_stride_e
         + n_offsets[:, None] * scale_stride_n
-        + (k_offsets[None, :] // 32) * scale_stride_g
+        + ((kp_offsets[None, :] * 2) // 32) * scale_stride_g
     )
-    raw_scale = tl.load(
-        scale_ptr + scale_offsets,
-        mask=(n_offsets[:, None] < N) & (k_offsets[None, :] < K),
-        other=0,
-    )
+    raw_scale = tl.load(scale_ptr + scale_offsets, mask=packed_mask, other=0)
     scale = _ue8m0_to_f32(raw_scale) if SCALE_IS_UE8M0 else raw_scale.to(tl.float32)
-    return values * scale
+
+    low = _decode_e2m1(packed & 0x0F) * scale
+    high = _decode_e2m1((packed >> 4) & 0x0F) * scale
+    # tl.join adds a trailing axis, so flattening sends element 2j + i to
+    # element j of operand i -- the interleaving the packing needs.
+    return tl.reshape(tl.join(low, high), (n_offsets.shape[0], k_offsets.shape[0]))
 
 
 @triton.jit
